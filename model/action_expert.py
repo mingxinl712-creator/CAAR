@@ -30,32 +30,6 @@ class CategorySpecificMLP(nn.Module):
         out = self.fc2(out)
         return out
 
-class MultiEmbodimentActionEncoder(nn.Module):
-    def __init__(self, action_dim: int, embed_dim: int, hidden_dim: int, horizon: int, num_categories: int = 1):
-        super().__init__()
-        self.horizon = horizon
-        self.embed_dim = embed_dim
-        self.num_categories = num_categories
-
-        self.W1 = nn.Linear(action_dim, hidden_dim)
-        self.W2 = nn.Linear(hidden_dim, hidden_dim)
-        self.W3 = nn.Linear(hidden_dim, embed_dim)
-
-        self.pos_encoding = SinusoidalPositionalEncoding(hidden_dim, max_len=horizon)
-        self.activation = nn.ReLU(inplace=True)
-
-    def forward(self, action_seq: torch.Tensor):
-        B, H, D = action_seq.shape
-        x = action_seq.reshape(B * H, D)
-        out = self.activation(self.W1(x))
-        pos_enc = self.pos_encoding(H).to(out.device)
-        pos_enc = pos_enc.repeat(B, 1, 1).reshape(B * H, -1)
-        out = out + pos_enc
-        out = self.activation(self.W2(out))
-        out = self.W3(out)
-        out = out.view(B, H, self.embed_dim)
-        return out
-
 class BasicTransformerBlock(nn.Module):
     def __init__(self, embed_dim: int, num_heads: int, hidden_dim: int, dropout: float = 0.0):
         super().__init__()
