@@ -15,8 +15,7 @@ class caar(nn.Module):
         super().__init__() 
         self.config = config
         self._device = config.get("device", "cuda")
-        pretrain_vlm_path = config.get("pretrain_vlm_path", "/home/liumingxin/learning/ICML2026-1/pretrain-vlm/InternVL3-1B")
-        self.embedder = InternVL3Embedder(model_name=pretrain_vlm_path, device=self._device)
+        self.embedder = InternVL3Embedder(model_name=cfg.pretrain_vlm_path, device=self._device)
 
         self.action_expert = FlowmatchingActionHeadd(cfg=SimpleNamespace(
             embed_dim=config.get("embed_dim", 896),
@@ -64,21 +63,3 @@ class caar(nn.Module):
 
     def forward(self, fused_tokens, fused_mask, state, actions_gt=None):
         return self.predict_actions(fused_tokens, fused_mask, state, actions_gt)
-
-## 初始化冻结参数
-    def _freeze_module(self, module: nn.Module, name: str):
-        print(f"Freezing {name} parameters...")
-        for p in module.parameters():
-            p.requires_grad = False
-
-    def set_finetune_flags(self):
-        config = self.config  
-        if not config.get("finetune_vlm", False):
-            self._freeze_module(self.embedder, "VLM (InternVL3)")
-        else:
-            print("Finetuning VLM (InternVL3)...")
-
-        if not config.get("finetune_action_head", False):
-            self._freeze_module(self.action_expert, "Action Head")
-        else:
-            print("Finetuning Action Head...")
