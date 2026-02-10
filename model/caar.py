@@ -7,7 +7,7 @@ from PIL import Image
 import torch
 import torch.nn as nn
 from model.vlam_embedder import InternVL3Embedder
-from model.action_expert.flow_matching_post import FlowmatchingActionHeadd
+from model.action_expert import ActionExpert
 import time
 
 class caar(nn.Module):
@@ -17,7 +17,7 @@ class caar(nn.Module):
         self._device = config.get("device", "cuda")
         self.embedder = InternVL3Embedder(model_name=cfg.pretrain_vlm_path, device=self._device)
 
-        self.action_expert = FlowmatchingActionHeadd(cfg=SimpleNamespace(
+        self.action_expert = ActionExpert(cfg=SimpleNamespace(
             embed_dim=config.get("embed_dim", 896),
             horizon=config.get("horizon", 16),
             action_dim=config.get("action_dim", 7),
