@@ -8,7 +8,7 @@ pretrain_vlm_path: pretrain-vlm/InternVL3-1B
 # ===============================
 dataset_args:
   ################# dataset args #################
-  annotation_path: "data/annotation_all_M_16"
+  annotation_path: "data/annotation_all"
   data_root_path: "data"
   ################## action args ################## 
   num_frames: 16
