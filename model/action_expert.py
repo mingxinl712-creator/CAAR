@@ -4,6 +4,20 @@ import torch.nn as nn
 import numpy as np
 import time
 
+class SinusoidalPosEmb(nn.Module):
+    def __init__(self, dim):
+        super().__init__()
+        self.dim = dim
+
+    def forward(self, x):
+        device = x.device
+        half_dim = self.dim // 2
+        emb = math.log(10000) / (half_dim - 1)
+        emb = torch.exp(torch.arange(half_dim, device=device) * -emb)
+        emb = x[:, None] * emb[None, :]
+        emb = torch.cat((emb.sin(), emb.cos()), dim=-1)
+        return emb
+
 class SinusoidalPositionalEncoding(nn.Module):
     def __init__(self, dim: int, max_len: int = 1000):
         super().__init__()
@@ -18,7 +32,7 @@ class SinusoidalPositionalEncoding(nn.Module):
     def forward(self, seq_len: int):
         return self.pe[:, :seq_len, :]
 
-class CategorySpecificMLP(nn.Module):
+class MLP(nn.Module):
     def __init__(self, input_dim: int, hidden_dim: int, output_dim: int):
         super().__init__()
         self.fc1 = nn.Linear(input_dim, hidden_dim)
@@ -59,172 +73,6 @@ class BasicTransformerBlock(nn.Module):
         x = x2 + ff_out
 
         return x
-
-class FlowmatchingActionHead(nn.Module):
-    def __init__(self, cfg):
-        super().__init__()
-
-        self.horizon = cfg.horizon
-        self.action_dim = cfg.action_dim
-
-        embed_dim = cfg.embed_dim
-        hidden_dim = 4*cfg.embed_dim
-        action_dim = cfg.action_dim
-        state_dim = cfg.state_dim
-        num_heads = cfg.num_heads
-        num_layers = cfg.num_layers
-        dropout = cfg.dropout
-        self.num_inference_timesteps = 50
-
-        self.time_pos_enc = SinusoidalPositionalEncoding(embed_dim, max_len=1000)
-
-        self.transformer_blocks = nn.ModuleList([
-            BasicTransformerBlock(embed_dim=embed_dim, num_heads=num_heads,
-                                   hidden_dim=hidden_dim, dropout=dropout)
-            for _ in range(num_layers)
-        ])
-
-        self.norm_out = nn.LayerNorm(embed_dim)
-        self.state_encoder = CategorySpecificMLP(input_dim=state_dim, hidden_dim=hidden_dim, output_dim=embed_dim)
-        self.action_encoder = CategorySpecificMLP(input_dim=action_dim, hidden_dim=hidden_dim, output_dim=embed_dim)
-
-        self.mlp_head = SimpleMLPAdaLN(
-            in_channels=action_dim,
-            model_channels=1024,
-            out_channels=action_dim,
-            z_channels=embed_dim,
-            num_res_blocks=6,
-        )
-
-        self.masked_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-
-    def sample_orders(self, bsz):
-        # generate a batch of random generation orders
-        orders = []
-        for _ in range(bsz):
-            order = np.array(list(range(self.horizon)))
-            np.random.shuffle(order)
-            orders.append(order)
-        orders = torch.from_numpy(np.array(orders)).to(device=self.device, dtype=torch.long)
-        return orders
-
-    def random_masking(self, bsz, seq_len, orders):
-        # generate token mask
-        k_rand = torch.randint(1, self.horizon, (1,), device=self.device).item()
-        num_masked_tokens = self.horizon if (torch.rand((), device=self.device) < 0.3) else k_rand
-        mask = torch.zeros(bsz, seq_len, device=self.device)
-        idx = orders[:, :num_masked_tokens]
-        mask = torch.scatter(mask, dim=-1, index=idx,
-                             src=torch.ones_like(idx, dtype=mask.dtype, device=self.device))
-        return mask
-
-    def forward(self, fused_tokens, fused_mask, state, actions_gt):
-        B, H, _ = actions_gt.size()
-        ## context tokens
-        context_tokens = fused_tokens
-        state_emb = self.state_encoder(state)
-        context_tokens = torch.cat([context_tokens, state_emb], dim=1) 
-        ## context mask
-        context_mask = (fused_mask != 0)
-        context_mask = torch.cat([context_mask, torch.ones(B, 1, device=self.device, dtype=torch.bool)], dim=1)
-        context_mask = ~context_mask
-        ## orders
-        orders = self.sample_orders(bsz=B)
-        ## masked action tokens
-        masked_token = self.masked_token.repeat(B, H, 1)
-        action_emb = self.action_encoder(actions_gt)
-        mask = self.random_masking(bsz=B, seq_len=H, orders=orders)
-        m = mask.unsqueeze(-1)
-        actions_new = action_emb * (1 - m) + masked_token * m
-        ## transformer
-        action_query = actions_new + self.time_pos_enc(H).repeat(B, 1, 1)
-        x = action_query
-        for block in self.transformer_blocks:
-            x = block(x, context_tokens, context_mask)
-        x = self.norm_out(x)
-        x = x.view(B*H, -1)
-        ## Sample time t
-        t = torch.distributions.Beta(2, 2).sample((B*H,)).clamp(0.02, 0.98).to(self.device).to(dtype=self.dtype)
-        time_index = (t * 1000).long()
-        time_emb = self.time_pos_enc(1000)[:, time_index, :].squeeze(0)
-
-        actions_gt_seq = actions_gt.view(B*H, -1)
-        noise_seq = torch.rand_like(actions_gt_seq) * 2 - 1
-        t_broadcast = t.view(B*H, 1)
-        action_intermediate_seq = (1 - t_broadcast) * noise_seq + t_broadcast * actions_gt_seq
-
-        pred_velocity = self.mlp_head(action_intermediate_seq, time_emb, x)
-
-        pred_velocity = pred_velocity.view(B, H, -1)
-        noise_seq = noise_seq.view(B, H, -1)
-
-        return pred_velocity, noise_seq, m
-
-    def get_actions(self, fused_tokens, fused_mask, state, K=1):
-        B = fused_tokens.size(0)
-        H = self.horizon
-        D = self.action_dim
-        ## context tokens
-        context_tokens = fused_tokens
-        state_emb = self.state_encoder(state)
-        context_tokens = torch.cat([context_tokens, state_emb], dim=1)
-        ## context mask
-        context_mask = (fused_mask != 0)
-        context_mask = torch.cat([context_mask, torch.ones(B, 1, device=self.device, dtype=torch.bool)], dim=1)
-        context_mask = ~context_mask
-        ## order
-        orders = self.sample_orders(bsz=B)
-        ## initialization of action acd mask
-        actions = torch.zeros(B, H, D, device=self.device)
-        mask = torch.ones(B, H, device=self.device)
-        ## iterative generation
-        num_iter = (H + K - 1) // K
-        for it in range(num_iter):
-            ## current indices to fill
-            start = it * K
-            end = min((it + 1) * K, H)
-            idx_to_fill = orders[:, start:end] 
-            k_now = idx_to_fill.size(1)
-            ## masked action tokens
-            masked_token = self.masked_token.repeat(B, H, 1)
-            action_emb = self.action_encoder(actions)
-            m = mask.unsqueeze(-1)
-            action_new = action_emb * (1 - m) + masked_token * m
-            ## transformer
-            action_query = action_new + self.time_pos_enc(H).repeat(B, 1, 1)
-            x = action_query
-            for block in self.transformer_blocks:
-                x = block(x, context_tokens, context_mask)
-            x = self.norm_out(x)
-            x_sel = x.gather(1, idx_to_fill.unsqueeze(-1).expand(-1, -1, x.size(-1)))
-            x_sel = x_sel.reshape(B * k_now, -1)
-            ## flow matching inference
-            action_seq = (torch.rand(B * k_now, D, device=self.device) * 2 - 1)
-            N = self.num_inference_timesteps
-            dt = 1.0 / N
-            for i in range(N):
-                t = i / N
-                time_index = int(t * 1000)
-                time_emb = self.time_pos_enc(1000)[:, time_index, :].to(self.device).squeeze(0)
-                time_emb = time_emb.unsqueeze(0).repeat(B * k_now, 1)
-                pred = self.mlp_head(action_seq, time_emb, x_sel)  
-                action_seq = action_seq + dt * pred
-            ## update actions and mask
-            action_seq = action_seq.view(B, k_now, D)
-            actions.scatter_(dim=1, index=idx_to_fill.unsqueeze(-1).expand(-1, -1, D), src=action_seq)
-            mask.scatter_(dim=1, index=idx_to_fill, src=torch.zeros_like(idx_to_fill, dtype=mask.dtype))
-
-        return actions
-
-    @property
-    def device(self):
-      
-        return next(self.parameters()).device
-    
-    @property
-    def dtype(self):
-        
-        return next(self.parameters()).dtype
 
 class SimpleMLPAdaLN(nn.Module):
     def __init__(
@@ -321,7 +169,7 @@ class FinalLayer(nn.Module):
 def modulate(x, shift, scale):
     return x * (1 + scale) + shift
 
-class FlowmatchingActionHeadd(nn.Module):
+class ActionExpert(nn.Module):
     def __init__(self, cfg):
         super().__init__()
 
@@ -337,7 +185,14 @@ class FlowmatchingActionHeadd(nn.Module):
         dropout = cfg.dropout
         self.num_inference_timesteps = 5
 
-        self.time_pos_enc = SinusoidalPositionalEncoding(embed_dim, max_len=1000)
+        self.time_pos_enc = SinusoidalPositionalEncoding(embed_dim)
+
+        self.time_mlp = nn.Sequential(
+                    SinusoidalPosEmb(embed_dim),
+                    nn.Linear(embed_dim, embed_dim),
+                    nn.SiLU(),
+                    nn.Linear(embed_dim, embed_dim),
+                )
 
         self.transformer_blocks = nn.ModuleList([
             BasicTransformerBlock(embed_dim=embed_dim, num_heads=num_heads,
@@ -346,8 +201,8 @@ class FlowmatchingActionHeadd(nn.Module):
         ])
 
         self.norm_out = nn.LayerNorm(embed_dim)
-        self.state_encoder = CategorySpecificMLP(input_dim=state_dim, hidden_dim=hidden_dim, output_dim=embed_dim)
-        self.action_encoder = CategorySpecificMLP(input_dim=action_dim, hidden_dim=hidden_dim, output_dim=embed_dim)
+        self.state_encoder = MLP(input_dim=state_dim, hidden_dim=hidden_dim, output_dim=embed_dim)
+        self.action_encoder = MLP(input_dim=action_dim, hidden_dim=hidden_dim, output_dim=embed_dim)
 
         self.mlp_head = SimpleMLPAdaLN(
             in_channels=action_dim,
@@ -418,15 +273,11 @@ class FlowmatchingActionHeadd(nn.Module):
             x_rep = x
             actions_gt_rep = actions_gt_seq
 
-        # Sample t: (B*H*M,)
-        t = torch.distributions.Beta(2, 2).sample((actions_gt_rep.size(0),)) \
-            .clamp(0.02, 0.98).to(self.device, dtype=torch.float32)
-
-        time_index = (t * 1000).long()
-        time_emb = self.time_pos_enc.pe[:, time_index, :].squeeze(0).to(dtype=self.dtype)  # (B*H*M, C)
+        t = torch.rand((B*H*M,), device=self.device).to(self.dtype)
+        time_emb = self.time_mlp(t)
 
         # noise + interpolate
-        noise_seq = torch.rand_like(actions_gt_rep) * 2 - 1
+        noise_seq = torch.randn_like(actions_gt_rep)
         t_broadcast = t.to(dtype=actions_gt_rep.dtype).view(-1, 1)
         action_intermediate_seq = (1 - t_broadcast) * noise_seq + t_broadcast * actions_gt_rep
 
@@ -478,14 +329,13 @@ class FlowmatchingActionHeadd(nn.Module):
             x_sel = x.gather(1, idx_to_fill.unsqueeze(-1).expand(-1, -1, x.size(-1)))
             x_sel = x_sel.reshape(B * k_now, -1)
             ## flow matching inference
-            action_seq = (torch.rand(B * k_now, D, device=self.device) * 2 - 1)
+            action_seq = torch.randn(B * k_now, D, device=self.device)
             N = self.num_inference_timesteps
             dt = 1.0 / N
             for i in range(N):
                 t = i / N
-                time_index = int(t * 1000)
-                time_emb = self.time_pos_enc(1000)[:, time_index, :].to(self.device).squeeze(0)
-                time_emb = time_emb.unsqueeze(0).repeat(B * k_now, 1)
+                t = torch.full((B*k_now,), t, device=self.device, dtype=self.dtype)
+                time_emb = self.time_mlp(t)
                 pred = self.mlp_head(action_seq, time_emb, x_sel)  
                 action_seq = action_seq + dt * pred
             ## update actions and mask
