@@ -1,0 +1,55 @@
+# ===============================
+# Basic config
+# ===============================
+device: "cuda"
+pretrain_vlm_path: pretrain-vlm/InternVL3-1B
+# ===============================
+# Dataset
+# ===============================
+dataset_args:
+  ################# dataset args #################
+  annotation_path: "data/annotation_all_M_16"
+  data_root_path: "data"
+  ################## action args ################## 
+  num_frames: 16
+  ################## augmentation args ############
+  use_augmentation: true
+  max_views: 3
+# ===============================
+# Training
+# ===============================
+lr: 1e-5
+batch_size: 4 # 16 for 4 GPUs
+num_workers: 4
+max_steps: 80000
+warmup_steps: 1000
+weight_decay: 1e-3
+# ===============================
+# Logging & checkpointing
+# ===============================
+log_interval: 50
+ckpt_interval: 1000
+save_dir: "./checkpoints_metaworld"
+# ===============================
+# Resume
+# ===============================  
+resume: true
+resume_path: "Path"
+# ===============================
+# Finetuning
+# ===============================
+finetune_vlm: true
+finetune_action_head: ture
+# ===============================
+# Model parameters
+# ===============================
+embed_dim: 896
+horizon: 16
+action_dim: 4
+state_dim: 4
+num_heads: 8
+num_layers: 8
+# ===============================
+# Dropout
+# ===============================
+dropout: 0.1
